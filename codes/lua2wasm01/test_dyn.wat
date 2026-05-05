@@ -154,34 +154,45 @@
             )
         )
 
-  (func $fib (export "fib") (param $n (ref null $Val)) (result (ref null $Val))
+  (func $main (export "main")
+    (local $s (ref null $Val))
+    (local $t (ref null $Val))
     (local $tmp_table (ref null $Val))
-    local.get $n
+    i32.const 0
+    i32.const 5
+    call $make_str
+    local.set $s
+    call $make_table
+    local.set $tmp_table
+    local.get $tmp_table
+    i32.const 5
+    i32.const 1
+    call $make_str
     f64.const 1
     call $make_num
-    call $val_le
-    call $is_truthy
-    if
-      local.get $n
-      return
-    else
-      local.get $n
-      f64.const 1
-      call $make_num
-      call $val_sub
-      call $fib
-      local.get $n
-      f64.const 2
-      call $make_num
-      call $val_sub
-      call $fib
-      call $val_add
-      return
-    end
-    call $make_nil
-    return
+    call $table_set
+    local.get $tmp_table
+    f64.const 2
+    call $make_num
+    i32.const 6
+    i32.const 1
+    call $make_str
+    call $table_set
+    local.get $tmp_table
+    local.set $t
+    local.get $t
+    i32.const 5
+    i32.const 1
+    call $make_str
+    call $table_get
+    call $print_val
+    local.get $t
+    f64.const 2
+    call $make_num
+    call $table_get
+    call $print_val
   )
-  (func $main (export "main")
-    (local $tmp_table (ref null $Val))
-  )
+  (data (i32.const 0) "\68\65\6c\6c\6f")
+  (data (i32.const 5) "\61")
+  (data (i32.const 6) "\62")
 )

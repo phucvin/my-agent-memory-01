@@ -183,5 +183,9 @@
   )
   (func $main (export "main")
     (local $tmp_table (ref null $Val))
+    f64.const 10
+    call $make_num
+    call $fib
+    call $print_val
   )
 )
