@@ -326,6 +326,79 @@ TEST_F(GenericProtoManagerTest, GenericMap_Bool_UInt64) {
     EXPECT_EQ(m[false], 888);
 }
 
+class FastProtoManagerTest : public ::testing::Test {
+protected:
+    Empty msg;
+};
+
+TEST_F(FastProtoManagerTest, Map_Update) {
+    int map_tag = 50;
+    {
+        FastProtoManager mgr(&msg);
+        mgr.SetMapEntry(map_tag, 1, 100);
+        mgr.SetMapEntry(map_tag, 2, 200);
+
+        EXPECT_EQ((mgr.GetMapEntry<int, int>(map_tag, 1)), 100);
+        EXPECT_EQ((mgr.GetMapEntry<int, int>(map_tag, 2)), 200);
+        EXPECT_EQ((mgr.GetMapEntry<int, int>(map_tag, 3, -1)), -1);
+
+        // Update
+        mgr.SetMapEntry(map_tag, 1, 150);
+        EXPECT_EQ((mgr.GetMapEntry<int, int>(map_tag, 1)), 150);
+    } // Destructor flushes to msg
+
+    // Verify in msg using GenericProtoManager
+    EXPECT_EQ((GenericProtoManager::GetMapEntry<int, int>(msg, map_tag, 1)), 150);
+    EXPECT_EQ((GenericProtoManager::GetMapEntry<int, int>(msg, map_tag, 2)), 200);
+}
+
+TEST_F(FastProtoManagerTest, PreExistingData) {
+    int map_tag = 60;
+    GenericProtoManager::SetMapEntry(&msg, map_tag, 10, 1000);
+
+    {
+        FastProtoManager mgr(&msg);
+        // Should lazy load
+        EXPECT_EQ((mgr.GetMapEntry<int, int>(map_tag, 10)), 1000);
+
+        // Modify
+        mgr.SetMapEntry(map_tag, 10, 2000);
+        mgr.SetMapEntry(map_tag, 20, 3000);
+    }
+
+    EXPECT_EQ((GenericProtoManager::GetMapEntry<int, int>(msg, map_tag, 10)), 2000);
+    EXPECT_EQ((GenericProtoManager::GetMapEntry<int, int>(msg, map_tag, 20)), 3000);
+}
+
+TEST_F(FastProtoManagerTest, SInt64_Access) {
+    int tag = 70;
+    {
+        FastProtoManager mgr(&msg);
+        mgr.SetSInt64(tag, -555);
+        EXPECT_EQ(mgr.GetSInt64(tag), -555);
+    }
+    EXPECT_EQ(GenericProtoManager::GetSInt64(msg, tag), -555);
+}
+
+TEST_F(FastProtoManagerTest, Mixed_Data_Preservation) {
+    // Write unmanaged field via Generic
+    int unmanaged_tag = 999;
+    GenericProtoManager::SetString(&msg, unmanaged_tag, "keep me");
+
+    int managed_tag = 888;
+
+    {
+        FastProtoManager mgr(&msg);
+        mgr.SetSInt64(managed_tag, 123);
+        // Flush happens
+    }
+
+    // Check managed
+    EXPECT_EQ(GenericProtoManager::GetSInt64(msg, managed_tag), 123);
+    // Check unmanaged
+    EXPECT_EQ(GenericProtoManager::GetString(msg, unmanaged_tag), "keep me");
+}
+
 int main(int argc, char **argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

@@ -10,6 +10,8 @@
 #include <functional>
 #include <type_traits>
 #include <map>
+#include <unordered_map>
+#include <memory>
 
 namespace pb = google::protobuf;
 
@@ -512,12 +514,6 @@ public:
                         break;
                     }
                 }
-                // Packed fields are usually one entry, but multiple can exist (should be concatenated technically).
-                // Here we just take the first one found or we could accumulate.
-                // Standard protobuf merges multiple packed fields. Let's assume one for simplicity or continue?
-                // The prompt says "Scan for TYPE_LENGTH_DELIMITED".
-                // We'll stick to finding the last one or merging.
-                // Merging is safer.
             }
         }
         return result;
@@ -534,8 +530,6 @@ public:
         for (uint64_t val : values) {
             coded_output.WriteVarint64(val);
         }
-        // CodedOutputStream destructor or Trim might be needed?
-        // It flushes on destruction or Trim. StringOutputStream does not need flush.
         coded_output.Trim();
 
         ufs->AddLengthDelimited(tag, buffer);
@@ -549,7 +543,6 @@ public:
         for (int sibling : sibling_tags) {
             ufs->DeleteByNumber(sibling);
         }
-        // Note: The setter likely calls DeleteByNumber(target_tag) internally too (e.g. SetSInt64).
         setter(msg, target_tag, value);
     }
 
@@ -557,9 +550,9 @@ public:
 
     template <typename KeyT, typename ValT>
     static void SetMapEntry(pb::Message* msg, int map_tag, KeyT key, ValT value) {
+        // Implementation from original code (omitted here as it's the same logic, assume it calls MutableUFS and does scan)
+        // For brevity in this re-write, I'm just pasting the body of the original function.
         auto* ufs = MutableUFS(msg);
-
-        // 1. Scan and delete existing entry with same key
         for (int i = ufs->field_count() - 1; i >= 0; --i) {
             const auto& field = ufs->field(i);
             if (field.number() == map_tag && field.type() == pb::UnknownField::TYPE_LENGTH_DELIMITED) {
@@ -591,7 +584,6 @@ public:
             entry_deleted:;
         }
 
-        // 2. Add new entry
         std::string buffer;
         pb::io::StringOutputStream output(&buffer);
         pb::io::CodedOutputStream coded_output(&output);
@@ -673,7 +665,6 @@ public:
                     } else if (field_num == 2) {
                          if (pb::internal::WireFormatLite::GetTagWireType(tag) ==
                             pb::internal::WireFormatLite::WireTypeForFieldType(gpm_internal::MapTypeHandler<ValT>::kFieldType)) {
-                             // Just read the value, we use default if not present
                              gpm_internal::MapTypeHandler<ValT>::Read(&coded_input, &read_value);
                          } else { pb::internal::WireFormatLite::SkipField(&coded_input, tag); }
                     } else {
@@ -695,8 +686,6 @@ public:
     static T GetNestedMessage(const pb::Message& msg, int tag) {
         T local_msg;
         const auto& ufs = GetUFS(msg);
-        // Find the LAST occurrence? Or merge all? Standard protobuf merges.
-        // We'll merge all found.
         for (int i = 0; i < ufs.field_count(); ++i) {
             const auto& field = ufs.field(i);
             if (field.number() == tag && field.type() == pb::UnknownField::TYPE_LENGTH_DELIMITED) {
@@ -708,17 +697,12 @@ public:
 
     static void SetNestedMessage(pb::Message* msg, int tag, const pb::Message& nested_msg) {
         auto* ufs = MutableUFS(msg);
-        ufs->DeleteByNumber(tag); // Last-one-wins for singular message field
+        ufs->DeleteByNumber(tag);
 
         std::string bytes;
         nested_msg.SerializeToString(&bytes);
         ufs->AddLengthDelimited(tag, bytes);
     }
-
-    // --- Group Support ---
-    // "Explicitly handle TYPE_GROUP by traversing the nested UnknownFieldSet tree."
-    // We can provide a way to get a GenericProtoManager view of a Group?
-    // Or just GetGroup as UnknownFieldSet?
 
     static const pb::UnknownFieldSet* GetGroup(const pb::Message& msg, int tag) {
         const auto& ufs = GetUFS(msg);
@@ -729,5 +713,184 @@ public:
              }
         }
         return nullptr;
+    }
+};
+
+// --- Optimized Stateful Manager ---
+
+class FastProtoManager {
+public:
+    explicit FastProtoManager(pb::Message* msg) : msg_(msg) {
+        Load();
+    }
+
+    ~FastProtoManager() {
+        Flush();
+    }
+
+    // Explicitly flush changes to the message
+    void Flush() {
+        auto* ufs = msg_->GetReflection()->MutableUnknownFields(msg_);
+        ufs->Clear();
+
+        // Write structured fields
+        for (auto& kv : fields_) {
+            if (kv.second.map_handler) {
+                kv.second.map_handler->Serialize(ufs, kv.first);
+            } else {
+                // Write raw fields (deep copy via MergeFrom)
+                ufs->MergeFrom(kv.second.raw_ufs);
+            }
+        }
+    }
+
+    template <typename KeyT, typename ValT>
+    void SetMapEntry(int tag, KeyT key, ValT value) {
+        auto& entry = fields_[tag];
+        if (!entry.map_handler) {
+            entry.map_handler.reset(new MapHandler<KeyT, ValT>());
+            // Lazy load existing entries
+            for (int i = 0; i < entry.raw_ufs.field_count(); ++i) {
+                const auto& field = entry.raw_ufs.field(i);
+                if (field.type() == pb::UnknownField::TYPE_LENGTH_DELIMITED) {
+                    entry.map_handler->ParseEntry(field.length_delimited());
+                }
+            }
+            // Clear raw fields as they are now in the map handler
+            entry.raw_ufs.Clear();
+        }
+
+        // Verify type via dynamic_cast
+        auto* handler = dynamic_cast<MapHandler<KeyT, ValT>*>(entry.map_handler.get());
+        if (handler) {
+            handler->map_[key] = value;
+        } else {
+            entry.map_handler.reset(new MapHandler<KeyT, ValT>());
+            handler = static_cast<MapHandler<KeyT, ValT>*>(entry.map_handler.get());
+            handler->map_[key] = value;
+        }
+    }
+
+    template <typename KeyT, typename ValT>
+    ValT GetMapEntry(int tag, KeyT key, ValT default_value = ValT()) {
+        auto& entry = fields_[tag];
+        if (!entry.map_handler) {
+            if (entry.raw_ufs.empty()) return default_value;
+
+            entry.map_handler.reset(new MapHandler<KeyT, ValT>());
+            for (int i = 0; i < entry.raw_ufs.field_count(); ++i) {
+                 const auto& field = entry.raw_ufs.field(i);
+                 if (field.type() == pb::UnknownField::TYPE_LENGTH_DELIMITED) {
+                    entry.map_handler->ParseEntry(field.length_delimited());
+                }
+            }
+            entry.raw_ufs.Clear();
+        }
+
+        auto* handler = dynamic_cast<MapHandler<KeyT, ValT>*>(entry.map_handler.get());
+        if (handler) {
+            auto it = handler->map_.find(key);
+            if (it != handler->map_.end()) return it->second;
+        }
+        return default_value;
+    }
+
+    // Helper for scalars (SInt64 example)
+    void SetSInt64(int tag, int64_t value) {
+        auto& entry = fields_[tag];
+        entry.raw_ufs.Clear(); // Last one wins
+        entry.map_handler.reset(); // If it was a map, it's not anymore
+
+        uint64_t encoded = pb::internal::WireFormatLite::ZigZagEncode64(value);
+        entry.raw_ufs.AddVarint(tag, encoded);
+    }
+
+    int64_t GetSInt64(int tag) {
+        auto it = fields_.find(tag);
+        if (it == fields_.end()) return 0;
+        const auto& entry = it->second;
+        // Search raw fields
+        for (int i = 0; i < entry.raw_ufs.field_count(); ++i) {
+             const auto& field = entry.raw_ufs.field(i);
+             if (field.type() == pb::UnknownField::TYPE_VARINT) {
+                 return pb::internal::WireFormatLite::ZigZagDecode64(field.varint());
+             }
+        }
+        return 0;
+    }
+
+private:
+    struct MapHandlerBase {
+        virtual ~MapHandlerBase() {}
+        virtual void ParseEntry(const std::string& bytes) = 0;
+        virtual void Serialize(pb::UnknownFieldSet* ufs, int tag) = 0;
+    };
+
+    template <typename KeyT, typename ValT>
+    struct MapHandler : MapHandlerBase {
+        std::map<KeyT, ValT> map_;
+
+        void ParseEntry(const std::string& bytes) override {
+            pb::io::ArrayInputStream input(bytes.data(), bytes.size());
+            pb::io::CodedInputStream coded_input(&input);
+            uint32_t tag;
+            KeyT key = KeyT();
+            ValT value = ValT();
+            bool has_key = false;
+
+            while ((tag = coded_input.ReadTag()) != 0) {
+                int field_num = pb::internal::WireFormatLite::GetTagFieldNumber(tag);
+                if (field_num == 1) {
+                    if (gpm_internal::MapTypeHandler<KeyT>::Read(&coded_input, &key)) has_key = true;
+                } else if (field_num == 2) {
+                    gpm_internal::MapTypeHandler<ValT>::Read(&coded_input, &value);
+                } else {
+                    pb::internal::WireFormatLite::SkipField(&coded_input, tag);
+                }
+            }
+            if (has_key) map_[key] = value;
+        }
+
+        void Serialize(pb::UnknownFieldSet* ufs, int tag) override {
+            for (const auto& kv : map_) {
+                std::string buffer;
+                pb::io::StringOutputStream output(&buffer);
+                pb::io::CodedOutputStream coded_output(&output);
+                gpm_internal::MapTypeHandler<KeyT>::Write(1, kv.first, &coded_output);
+                gpm_internal::MapTypeHandler<ValT>::Write(2, kv.second, &coded_output);
+                coded_output.Trim();
+                ufs->AddLengthDelimited(tag, buffer);
+            }
+        }
+    };
+
+    struct FieldEntry {
+        pb::UnknownFieldSet raw_ufs;
+        std::unique_ptr<MapHandlerBase> map_handler;
+    };
+
+    pb::Message* msg_;
+    std::unordered_map<int, FieldEntry> fields_;
+
+    void Load() {
+        const auto& ufs = msg_->GetReflection()->GetUnknownFields(*msg_);
+        for (int i = 0; i < ufs.field_count(); ++i) {
+            const auto& field = ufs.field(i);
+            int tag = field.number();
+
+            // Deep copy field into raw_ufs
+            auto* target = &fields_[tag].raw_ufs;
+            if (field.type() == pb::UnknownField::TYPE_VARINT) {
+                target->AddVarint(tag, field.varint());
+            } else if (field.type() == pb::UnknownField::TYPE_FIXED32) {
+                target->AddFixed32(tag, field.fixed32());
+            } else if (field.type() == pb::UnknownField::TYPE_FIXED64) {
+                target->AddFixed64(tag, field.fixed64());
+            } else if (field.type() == pb::UnknownField::TYPE_LENGTH_DELIMITED) {
+                target->AddLengthDelimited(tag, field.length_delimited());
+            } else if (field.type() == pb::UnknownField::TYPE_GROUP) {
+                target->AddGroup(tag)->MergeFrom(field.group());
+            }
+        }
     }
 };
